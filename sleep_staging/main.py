@@ -13,12 +13,12 @@ import numpy.random as npr
 import scipy.signal as ssg
 import tqdm
 from sklearn.model_selection import KFold
+
 from vnv.np import sl_window
 
 from . import eeg
 from . import learners as lrn
 
-DATA_DIR = "../data/al"
 # these are traces with glaring artefacts
 BLACKLIST = [
     "0909045",
@@ -88,7 +88,6 @@ def process_to_hdf5(
             may use this to precompute expensive feature transforms.
         overwrite: by default, this function will skip writing HDF5 files that
             exists already. This function forces an overwrite.
-
     """
 
     extra_transformations = extra_transformations or {}
@@ -108,14 +107,14 @@ def process_to_hdf5(
 
         name, tr, y, w = file_traces
         try:
-            f = h5py.File(hn, "weights")
+            f = h5py.File(hn, "w")
             f.attrs["name"] = name
             print(f"Writing tr, shape {tr.shape}")
             f.create_dataset("trace", tr.shape, dtype=np.float32)[:] = tr[:]
             print(f"Writing y, shape {y.shape}")
             f.create_dataset("y", y.shape, dtype=np.float32)[:] = y[:]
             print(f"Writing w, shape {w.shape}")
-            f.create_dataset("weights", w.shape, dtype=np.float32)[:] = w[:]
+            f.create_dataset("w", w.shape, dtype=np.float32)[:] = w[:]
             for k, v in extra_transformations.items():
                 out = v(tr)
                 print(f"write {k}, shape {out.shape}")
@@ -147,8 +146,8 @@ def load_hdf5(
     Loads the traces from an HDF5 file given by `fn`.
 
     if `write_to` is given, the traces are loaded to pre_existing arrays. The
-    keys of `write_to` should match the keys of the HDF5 file. Otherwise,
-    new arrays are allocated for the output.
+    keys of `write_to` should match the keys of the HDF5 file. Otherwise, new
+    arrays are allocated for the output.
     """
 
     print(f"Loading file {fn}")
@@ -158,20 +157,22 @@ def load_hdf5(
     f = h5py.File(fn, "r")
 
     y = write_to.get("y") or np.zeros(f["y"].shape, dtype=f["y"].dtype)
-    w = write_to.get("y") or np.zeros(
-        f["weights"].shape, dtype=f["weights"].dtype
-    )
+    w = write_to.get("y") or np.zeros(f["w"].shape, dtype=f["w"].dtype)
     f["y"].read_direct(y)
-    f["weights"].read_direct(w)
+    f["w"].read_direct(w)
 
     name: str = f.attrs["name"]
 
     try:
         if not do_traces:
-            xh = write_to.get("xh") or np.zeros(f["xh"].shape, dtype=np.float32)
-            f["xh"].read_direct(xh)
-            xl = write_to.get("xl") or np.zeros(f["xl"].shape, dtype=np.float32)
-            f["xl"].read_direct(xl)
+            xh = write_to.get("x_h") or np.zeros(
+                f["x_h"].shape, dtype=np.float32
+            )
+            f["x_h"].read_direct(xh)
+            xl = write_to.get("x_l") or np.zeros(
+                f["x_l"].shape, dtype=np.float32
+            )
+            f["x_l"].read_direct(xl)
             return (name, y, xh, xl, w)
         else:
             trc = write_to.get(
@@ -235,11 +236,13 @@ def fetch_dir(
     xls, xhs, ys, ws = [], [], [], []
     n_classes = np.zeros(6, dtype=np.float32)
 
+    # this loop double-checks that all the files have uniformly shaped input
+    # data
     for fn in fns:
         f = h5py.File(fn, "r")
 
         ly = len(f["y"])
-        lw = len(f["weights"])
+        lw = len(f["w"])
 
         if ly != lw:
             print(f"WARNING: {fn}: y/w mismatch ({ly}/{lw}), skipping")
@@ -252,18 +255,18 @@ def fetch_dir(
         w = np.zeros(l, dtype=np.float32)
 
         f["y"].read_direct(y)
-        f["weights"].read_direct(w)
+        f["w"].read_direct(w)
         ys.append(y)
         ws.append(w)
 
         n_classes += np.sum(y, axis=0)
 
-        nc = f["xl"].shape[0]
-        nf_l = f["xl"].shape[1]
-        nf_h = f["xh"].shape[1]
+        nc = f["x_l"].shape[0]
+        nf_l = f["x_l"].shape[1]
+        nf_h = f["x_h"].shape[1]
         # "raw" n_t values which counts bins in the next page
-        nt_l = (f["xl"].shape[2] + xover - 1) // l
-        nt_h = (f["xh"].shape[2] + xover - 1) // l
+        nt_l = (f["x_l"].shape[2] + xover - 1) // l
+        nt_h = (f["x_h"].shape[2] + xover - 1) // l
 
         if nc0 is None:
             nc0 = nc
@@ -272,13 +275,13 @@ def fetch_dir(
             nt_l0 = nt_l
             nt_h0 = nt_h
 
-        nt_full_l, nt_full_h = f["xl"].shape[2], f["xh"].shape[2]
+        nt_full_l, nt_full_h = f["x_l"].shape[2], f["x_h"].shape[2]
 
         # all files must have uniform channels, freq bins, and valid lengths
         assert nc0 == nc
         assert nf_h == nf_h0
         assert nf_l == nf_l0
-        assert f["xh"].shape[1] == nf_h and f["xl"].shape[1] == nf_l
+        assert f["x_h"].shape[1] == nf_h and f["x_l"].shape[1] == nf_l
 
         assert (xover - 1 + nt_full_l) % l == 0
         assert (xover - 1 + nt_full_h) % l == 0
@@ -293,9 +296,10 @@ def fetch_dir(
             wh = np.where(y[:, i] > 0)[0]
             w[wh] *= class_w[i]
 
-    size_l = nt_l - xover + 1
-    size_h = nt_h - xover + 1
+    size_l = nt_l0 - xover + 1
+    size_h = nt_h0 - xover + 1
 
+    print("Loading tensors from files...")
     for fx, fn in tqdm.tqdm(enumerate(fns)):
         f = h5py.File(fn, "r")
         l = lens[fx]
@@ -319,10 +323,10 @@ def fetch_dir(
 
         y, w = ys[fx], ws[fx]
 
-        dump_l = np.zeros(f["xl"].shape, np.float32)
-        dump_h = np.zeros(f["xh"].shape, np.float32)
-        f["xl"].read_direct(dump_l)
-        f["xh"].read_direct(dump_h)
+        dump_l = np.zeros(f["x_l"].shape, np.float32)
+        dump_h = np.zeros(f["x_h"].shape, np.float32)
+        f["x_l"].read_direct(dump_l)
+        f["x_h"].read_direct(dump_h)
 
         if multiwindow:
             xh = np.zeros((l, nc, nf_h, size_h), dtype=np.float16)
@@ -443,12 +447,13 @@ def score_top_k(yt: ty.List[int], yp: np.ndarray):
     return acc_at, prc_at, rec_at, f1_at
 
 
-def main(bs=128, lim=1000, bag=None, mw=False) -> None:
+def main() -> None:
 
     from argparse import ArgumentParser
 
     parser = ArgumentParser()
-    parser.add_argument("name", type=str, help="name to give the model")
+    parser.add_argument("model_name", type=str, help="name to give the model")
+    parser.add_argument("data_dir", type=str, help="name to give the model")
     parser.add_argument(
         "--bs", type=int, default=128, help="batch size to use for training"
     )
@@ -459,25 +464,29 @@ def main(bs=128, lim=1000, bag=None, mw=False) -> None:
         help="number of bags to use. Bagging is disabled if not passed",
     )
     parser.add_argument(
-        "--lim",
+        "--max-traces",
         type=int,
         default=None,
         help="maximum number of traces to load from the directory. "
         "Useful for debugging",
     )
+    parser.add_argument(
+        "--sw", action="store_true", help="run single-window training"
+    )
 
     args = parser.parse_args()
+    mw = not args.sw
 
     model_params, xls, xhs, ys, ws, fns = fetch_dir(
-        DATA_DIR, BLACKLIST, 4, lim=lim, multiwindow=False
+        args.data_dir, BLACKLIST, 4, lim=args.max_traces, multiwindow=False
     )
 
     print(model_params)
 
     fns = [osp.basename(fn) for fn in fns]
 
-    pred_dir = osp.join(args.name, "predict")
-    wgh_dir = osp.join(args.name, "weights")
+    pred_dir = osp.join(args.model_name, "predict")
+    wgh_dir = osp.join(args.model_name, "w")
 
     os.makedirs(pred_dir, exist_ok=True)
     os.makedirs(wgh_dir, exist_ok=True)
@@ -489,9 +498,11 @@ def main(bs=128, lim=1000, bag=None, mw=False) -> None:
         print(f"FOLD {sx}")
         sname = f"fold_{sx}"
 
-        if bag is not None:
-            sub_train = [npr.choice(train, size=len(train)) for _ in range(bag)]
-            bag_suffs = [f"_bag_{bx}" for bx in range(bag)]
+        if args.bag is not None:
+            sub_train = [
+                npr.choice(train, size=len(train)) for _ in range(args.bag)
+            ]
+            bag_suffs = [f"_bag_{bx}" for bx in range(args.bag)]
         else:
             bag_suffs = [""]
             sub_train = [train]
@@ -513,14 +524,19 @@ def main(bs=128, lim=1000, bag=None, mw=False) -> None:
                 sub_train[bx], xls, xhs, ys, ws, mw=mw
             )
 
-            swwfn = "../models/sw2/predict/fold_0.hdf5"
+            # XXX was this anything special?
+            # swwfn = "../models/sw2/predict/fold_0.hdf5"
+
             m = lrn.model_main(
-                *model_params, noise=True, mw=mw, preload_weights=swwfn
+                *model_params,
+                noise=True,
+                mw=mw,
+                # XXX preload_weights=swwfn,
             )
             m.fit(
                 [txl, txh],
                 ty,
-                batch_size=bs,
+                batch_size=args.bs,
                 epochs=100,
                 validation_data=([vxl, vxh], vy, vw),
                 callbacks=[
