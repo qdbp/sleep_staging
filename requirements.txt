@@ -1,0 +1,6 @@
+numpy
+scipy
+tqdm
+scikit-learn
+pyedflib
+git+https://github.com/qdbp/vnv.git#egg=vnv[keras]
